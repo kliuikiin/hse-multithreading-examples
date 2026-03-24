@@ -14,7 +14,7 @@ int main() {
         auto msg = consumer.Recv(1);
         if (msg) {
             std::printf("[consumer] received type=1: %s\n",
-                        reinterpret_cast<const char*>(msg->payload));
+                        reinterpret_cast<const char*>(msg->payload.data()));
         }
     }
     return 0;
