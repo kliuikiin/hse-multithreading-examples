@@ -1,96 +1,106 @@
 #pragma once
 
-#include <fcntl.h>
-#include <semaphore.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cstdint>
+#include <new>
 #include <stdexcept>
-#include <type_traits>
 
-template <typename T>
+static constexpr uint32_t MAX_TASKS = 65536;
+
+using TaskFn = int (*)(int);
+
+struct TaskMsg {
+    TaskFn   func;
+    int      arg;
+    uint32_t task_id;
+};
+
+struct TaskResult {
+    std::atomic<uint8_t> ready{0};
+    int value;
+};
+
+struct PoolSHM {
+    std::atomic<uint32_t> task_counter{0};
+    TaskResult results[MAX_TASKS];
+};
+
 class Future {
-    static_assert(std::is_trivially_copyable_v<T>,
-                  "ProcessPool only supports trivially copyable result types");
-
 public:
-    Future(int pipe_read_fd, pid_t pid) : fd_(pipe_read_fd), pid_(pid) {}
+    Future(PoolSHM* shm, uint32_t id) : shm_(shm), id_(id) {}
 
-    Future(const Future&) = delete;
-    Future& operator=(const Future&) = delete;
-
-    Future(Future&& other) noexcept : fd_(other.fd_), pid_(other.pid_) {
-        other.fd_  = -1;
-        other.pid_ = -1;
-    }
-
-    ~Future() {
-        if (fd_ != -1) close(fd_);
-        if (pid_ != -1) waitpid(pid_, nullptr, 0);
-    }
-
-    T Get() {
-        T result;
-        if (read(fd_, &result, sizeof(T)) != sizeof(T))
-            throw std::runtime_error("Future::Get read failed");
-        close(fd_);
-        fd_ = -1;
-        waitpid(pid_, nullptr, 0);
-        pid_ = -1;
-        return result;
+    int Get() {
+        auto& slot = shm_->results[id_ % MAX_TASKS];
+        while (!slot.ready.load(std::memory_order_acquire)) {}
+        int val = slot.value;
+        slot.ready.store(0, std::memory_order_release);
+        return val;
     }
 
 private:
-    int   fd_;
-    pid_t pid_;
+    PoolSHM* shm_;
+    uint32_t id_;
 };
 
 class ProcessPool {
 public:
-    explicit ProcessPool(int max_workers, const char* sem_name = "/process_pool")
-        : sem_name_(sem_name) {
-        sem_unlink(sem_name_);
-        sem_ = sem_open(sem_name_, O_CREAT | O_EXCL, 0666, max_workers);
-        if (sem_ == SEM_FAILED) throw std::runtime_error("sem_open failed");
+    explicit ProcessPool(int n) : n_(n) {
+        shm_ = static_cast<PoolSHM*>(
+            mmap(nullptr, sizeof(PoolSHM), PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+        if (shm_ == MAP_FAILED) throw std::runtime_error("mmap failed");
+        new (shm_) PoolSHM{};
+
+        if (pipe(work_pipe_) == -1) throw std::runtime_error("pipe failed");
+
+        for (int i = 0; i < n_; ++i) {
+            pid_t pid = fork();
+            if (pid == -1) throw std::runtime_error("fork failed");
+            if (pid == 0) {
+                close(work_pipe_[1]);
+                WorkerLoop();
+                _exit(0);
+            }
+            workers_[i] = pid;
+        }
+        close(work_pipe_[0]);
     }
 
     ~ProcessPool() {
-        sem_close(sem_);
-        sem_unlink(sem_name_);
+        TaskMsg quit{nullptr, 0, 0};
+        for (int i = 0; i < n_; ++i)
+            write(work_pipe_[1], &quit, sizeof(quit));
+        for (int i = 0; i < n_; ++i)
+            waitpid(workers_[i], nullptr, 0);
+        close(work_pipe_[1]);
+        munmap(shm_, sizeof(PoolSHM));
     }
 
-    template <typename F>
-    auto Submit(F task) -> Future<std::invoke_result_t<F>> {
-        using T = std::invoke_result_t<F>;
-
-        sem_wait(sem_);
-
-        int pipefd[2];
-        if (pipe(pipefd) == -1) {
-            sem_post(sem_);
-            throw std::runtime_error("pipe failed");
-        }
-
-        pid_t pid = fork();
-        if (pid == -1) {
-            sem_post(sem_);
-            throw std::runtime_error("fork failed");
-        }
-
-        if (pid == 0) {
-            close(pipefd[0]);
-            T result = task();
-            write(pipefd[1], &result, sizeof(T));
-            close(pipefd[1]);
-            sem_post(sem_);
-            _exit(0);
-        }
-
-        close(pipefd[1]);
-        return Future<T>(pipefd[0], pid);
+    Future Submit(TaskFn func, int arg) {
+        uint32_t id = shm_->task_counter.fetch_add(1, std::memory_order_relaxed);
+        TaskMsg msg{func, arg, id};
+        write(work_pipe_[1], &msg, sizeof(msg));
+        return Future(shm_, id);
     }
 
 private:
-    sem_t*      sem_;
-    const char* sem_name_;
+    void WorkerLoop() {
+        TaskMsg msg;
+        while (read(work_pipe_[0], &msg, sizeof(msg)) == sizeof(msg)) {
+            if (msg.func == nullptr) break;
+            int result = msg.func(msg.arg);
+            shm_->results[msg.task_id % MAX_TASKS].value = result;
+            shm_->results[msg.task_id % MAX_TASKS].ready.store(1, std::memory_order_release);
+        }
+    }
+
+    static constexpr int kMaxWorkers = 64;
+    int      n_;
+    pid_t    workers_[kMaxWorkers];
+    int      work_pipe_[2];
+    PoolSHM* shm_;
 };
